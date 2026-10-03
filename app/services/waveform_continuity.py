@@ -16,10 +16,17 @@ acquisition ranges overlap?":
   every ingestion id carrying that segment is retained so re-ingestions stay
   auditable.
 * Endpoints are swept left to right: an interior point covered by ``>= 1``
-  unique segment is **covered**, by ``>= 2`` unique segments it is
-  **overlapping** (overlap means acquisition ranges coincide -- nothing is
-  inferred about sample-content conflicts).  Abutting intervals of the same
-  class are merged.
+  unique segment is **covered**.  ``coverage`` is that depth-``>= 1`` union,
+  so subintervals covered by ``>= 2`` unique segments stay **inside**
+  coverage and are additionally listed in ``overlaps`` (overlap means
+  acquisition ranges coincide -- nothing is inferred about sample-content
+  conflicts).  Abutting covered pieces are merged into one coverage segment
+  carrying the union of ingestion ids; the segment's ``coverage_count`` is
+  the highest unique-segment depth anywhere inside it (an overlap piece is
+  therefore re-listed under ``overlaps`` with its own depth, not removed from
+  coverage).  Consequently ``covered_s`` measures the acquired union and
+  ``covered_s + gap_s == window_s``; ``overlap_s`` counts only the covered
+  interior that is multiply covered.
 * Gaps are the uncovered interior subintervals, classified as leading,
   trailing or internal; a window with no records for a known station yields a
   single whole-window gap.  A station that was never ingested returns 404.
@@ -37,10 +44,12 @@ from sqlalchemy.orm import Session
 from ..models import Waveform
 from .pipeline import ApiError, from_epoch, iso_z, to_epoch, to_naive_utc
 
-# Half-open interval classes.
+# Half-open interval classes produced by the sweep.
 CLASS_GAP = "gap"          # zero unique segments cover the interior
 CLASS_COVERED = "covered"  # exactly one unique segment covers the interior
 CLASS_OVERLAP = "overlap"  # >= 2 unique segments cover the interior
+# Coverage reports the depth->=1 union: overlap pieces are presented both
+# inside a merged coverage segment and, with their own depth, in overlaps.
 
 # Segment endpoints closer than this are the same sample instant computed two
 # ways (stored microsecond start vs. start + npts/sr); cluster them so abutting
@@ -116,11 +125,17 @@ def continuity_check(
     segments.sort(key=lambda s: (s["start"], s["end"], s["ingestion_ids"][0]))
 
     raw_intervals = _sweep(w0, w1, segments)
-    merged = _merge_abutting(raw_intervals)
-
-    covered = [iv for iv in merged if iv["kind"] == CLASS_COVERED]
-    overlaps = [iv for iv in merged if iv["kind"] == CLASS_OVERLAP]
-    gaps = [iv for iv in merged if iv["kind"] == CLASS_GAP]
+    # Coverage is the depth->=1 union: merge all abutting covered *and*
+    # overlapping pieces into coverage segments (overlap stays counted as
+    # covered, not carved out).  Overlaps are re-listed separately after
+    # merging abutting overlap pieces only.
+    covered = _merge_coverage(
+        [iv for iv in raw_intervals if iv["kind"] != CLASS_GAP]
+    )
+    overlaps = _merge_abutting(
+        [iv for iv in raw_intervals if iv["kind"] == CLASS_OVERLAP]
+    )
+    gaps = [iv for iv in raw_intervals if iv["kind"] == CLASS_GAP]
     _label_gaps(gaps, w0, w1)
 
     duplicates = sorted(
@@ -254,7 +269,12 @@ def _union_ingestion_ids(segments: list[dict], active_ids: set[int]) -> list[str
 
 
 def _merge_abutting(intervals: list[dict]) -> list[dict]:
-    """Merge consecutive intervals of the same class (abutting ranges)."""
+    """Merge consecutive intervals of the same class (abutting ranges).
+
+    Used for the separately listed ``overlaps``: adjacent depth-``>= 2``
+    pieces (depth 2 abutting depth 3 abutting depth 2) form one overlap
+    segment.
+    """
     merged: list[dict] = []
     for iv in intervals:
         if (
@@ -262,17 +282,45 @@ def _merge_abutting(intervals: list[dict]) -> list[dict]:
             and merged[-1]["kind"] == iv["kind"]
             and iv["start"] - merged[-1]["end"] <= EPS_S
         ):
-            prev = merged[-1]
-            prev["end"] = iv["end"]
-            # Same coverage class => same coverage count; the union keeps every
-            # source ingestion that covers either side (relevant when two
-            # one-deep segments touch, which is one merged covered interval).
-            ids = set(prev["ingestion_ids"]) | set(iv["ingestion_ids"])
-            prev["ingestion_ids"] = sorted(ids)
-            prev["coverage_count"] = max(prev["coverage_count"], iv["coverage_count"])
+            _absorb(merged[-1], iv)
         else:
             merged.append(dict(iv))
     return merged
+
+
+def _merge_coverage(non_gap: list[dict]) -> list[dict]:
+    """Merge the depth-``>= 1`` union into abutting coverage segments.
+
+    Consecutive sweep pieces of *any* covered class (depth-1 covered and
+    depth-``>= 2`` overlap) that abut become one coverage segment, so the
+    union measure satisfies ``covered_s + gap_s == window_s``.  The merged
+    segment keeps the union of ingestion ids and reports the **maximum**
+    unique-segment depth reached inside it; the overlapping interior is not
+    lost -- it is still listed under ``overlaps`` with its own (sub-segment)
+    depth.
+    """
+    merged: list[dict] = []
+    for iv in non_gap:
+        if merged and iv["start"] - merged[-1]["end"] <= EPS_S:
+            _absorb(merged[-1], iv)
+        else:
+            merged.append(dict(iv))
+            # A coverage segment is the union; its kind stays "covered" even
+            # when its peak depth is an overlap interior.
+            merged[-1]["kind"] = CLASS_COVERED
+    return merged
+
+
+def _absorb(prev: dict, nxt: dict) -> None:
+    """Fold the abutting ``nxt`` piece into ``prev`` (union ids, peak depth)."""
+    prev["end"] = nxt["end"]
+    # The union keeps every source ingestion covering either side (relevant
+    # when two one-deep segments touch, or an overlap piece sits between two
+    # single-covered pieces); coverage_count is the peak unique depth across
+    # the merged range.
+    ids = set(prev["ingestion_ids"]) | set(nxt["ingestion_ids"])
+    prev["ingestion_ids"] = sorted(ids)
+    prev["coverage_count"] = max(prev["coverage_count"], nxt["coverage_count"])
 
 
 def _label_gaps(gaps: list[dict], win_start: float, win_end: float) -> None:
