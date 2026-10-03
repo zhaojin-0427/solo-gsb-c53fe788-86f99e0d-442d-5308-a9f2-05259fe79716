@@ -246,26 +246,45 @@ def test_different_data_hash_is_a_separate_segment_and_overlaps(client):
     rep = resp.json()
     assert rep["duplicate_waveform_count"] == 0
     assert rep["unique_segment_count"] == 2
-    assert rep["coverage"] == []          # every interior point has depth 2
+    # The whole range is in the coverage union (depth >= 1) ...
+    assert len(rep["coverage"]) == 1
+    cov = rep["coverage"][0]
+    assert cov["start"] == _iso(BASE_DT)
+    assert cov["end"] == _iso(BASE_DT + timedelta(seconds=20))
+    assert cov["coverage_count"] == 2
+    assert sorted(cov["ingestion_ids"]) == sorted([id1, id2])
+    # ... and the same full range is additionally listed as an overlap.
     assert len(rep["overlaps"]) == 1
     ov = rep["overlaps"][0]
     assert ov["start"] == _iso(BASE_DT)
     assert ov["end"] == _iso(BASE_DT + timedelta(seconds=20))
     assert ov["coverage_count"] == 2
     assert sorted(ov["ingestion_ids"]) == sorted([id1, id2])
-    assert rep["totals"]["overlap_s"] == 20.0
+    totals = rep["totals"]
+    assert totals["covered_s"] == 20.0   # union seconds, overlap not missing
+    assert totals["overlap_s"] == 20.0   # depth>=2 part, inside covered_s
+    assert totals["gap_s"] == 40.0
+    assert totals["covered_s"] + totals["gap_s"] == totals["window_s"]
     # Explicitly: overlap says nothing about sample-content conflicts.
     assert rep["overlap_semantics"] == "acquisition_range_only"
 
 
-def test_partial_overlap_splits_covered_overlap_covered(client):
-    # [0, 30) and [20, 50): covered [0,20), overlap [20,30), covered [30,50).
+def test_partial_overlap_is_one_coverage_union_with_overlap_inside(client):
+    # [0, 30) and [20, 50): coverage union [0,50) (count 2 inside),
+    # overlap [20,30), trailing gap [50,60).
     id1 = _ingest(client, BASE_DT, 30.0, "FF01")
     id2 = _ingest(client, BASE_DT + timedelta(seconds=20), 30.0, "FF02")
     resp = _check(client)
     rep = resp.json()
-    assert [(c["start"][-10:], c["duration_s"]) for c in rep["coverage"]]
-    assert [c["duration_s"] for c in rep["coverage"]] == [20.0, 20.0]
+    # Depth 1 -> 2 -> 1 across abutments merges into one coverage segment.
+    assert len(rep["coverage"]) == 1
+    cov = rep["coverage"][0]
+    assert cov["start"] == _iso(BASE_DT)
+    assert cov["end"] == _iso(BASE_DT + timedelta(seconds=50))
+    assert cov["duration_s"] == 50.0
+    assert cov["coverage_count"] == 2
+    assert sorted(cov["ingestion_ids"]) == sorted([id1, id2])
+
     assert [o["duration_s"] for o in rep["overlaps"]] == [10.0]
     ov = rep["overlaps"][0]
     assert ov["start"] == _iso(BASE_DT + timedelta(seconds=20))
@@ -274,26 +293,37 @@ def test_partial_overlap_splits_covered_overlap_covered(client):
     # Gaps: none leading/internal, one trailing.
     assert [g["gap_kind"] for g in rep["gaps"]] == ["trailing"]
     totals = rep["totals"]
-    assert totals["covered_s"] == 40.0
+    assert totals["covered_s"] == 50.0
     assert totals["overlap_s"] == 10.0
     assert totals["gap_s"] == 10.0
+    assert totals["covered_s"] + totals["gap_s"] == totals["window_s"]
 
 
-def test_three_deep_overlap_merges_same_class_abutments(client):
+def test_three_deep_overlap_merges_into_one_coverage_union(client):
     # [0, 30), [10, 40), [20, 50):
-    # covered [0,10), overlap [10,20)(depth2), overlap [20,30)(depth3),
-    # overlap [30,40)(depth2), covered [40,50), gap trailing.
+    # coverage union [0,50) (max depth 3), overlap [10,40) (depth2/3/2),
+    # gap trailing [50,60).
     _ingest(client, BASE_DT, 30.0, "FF01")
     _ingest(client, BASE_DT + timedelta(seconds=10), 30.0, "FF02")
     _ingest(client, BASE_DT + timedelta(seconds=20), 30.0, "FF03")
     resp = _check(client)
     rep = resp.json()
-    assert [c["duration_s"] for c in rep["coverage"]] == [10.0, 10.0]
+    assert len(rep["coverage"]) == 1
+    cov = rep["coverage"][0]
+    assert cov["start"] == _iso(BASE_DT)
+    assert cov["end"] == _iso(BASE_DT + timedelta(seconds=50))
+    assert cov["duration_s"] == 50.0
+    assert cov["coverage_count"] == 3
     assert len(rep["overlaps"]) == 1
     assert rep["overlaps"][0]["start"] == _iso(BASE_DT + timedelta(seconds=10))
     assert rep["overlaps"][0]["end"] == _iso(BASE_DT + timedelta(seconds=40))
     assert rep["overlaps"][0]["duration_s"] == 30.0
     assert rep["overlaps"][0]["coverage_count"] == 3
+    totals = rep["totals"]
+    assert totals["covered_s"] == 50.0
+    assert totals["overlap_s"] == 30.0
+    assert totals["gap_s"] == 10.0
+    assert totals["covered_s"] + totals["gap_s"] == totals["window_s"]
 
 
 def test_duplicate_plus_another_segment_overlap_uses_unique_depth(client):
@@ -307,11 +337,96 @@ def test_duplicate_plus_another_segment_overlap_uses_unique_depth(client):
     rep = resp.json()
     assert rep["unique_segment_count"] == 2
     assert rep["duplicate_waveform_count"] == 1
-    assert [c["duration_s"] for c in rep["coverage"]] == [10.0, 10.0]
+    # Union coverage [0,30): A [0,20) + B [10,30), merged across the overlap.
+    assert len(rep["coverage"]) == 1
+    cov = rep["coverage"][0]
+    assert cov["start"] == _iso(BASE_DT)
+    assert cov["end"] == _iso(BASE_DT + timedelta(seconds=30))
+    assert cov["duration_s"] == 30.0
+    assert cov["coverage_count"] == 2
+    assert sorted(cov["ingestion_ids"]) == sorted([id_a1, id_a2, id_b])
     assert [o["duration_s"] for o in rep["overlaps"]] == [10.0]
     ov = rep["overlaps"][0]
+    assert ov["start"] == _iso(BASE_DT + timedelta(seconds=10))
+    assert ov["end"] == _iso(BASE_DT + timedelta(seconds=20))
     assert ov["coverage_count"] == 2
     assert sorted(ov["ingestion_ids"]) == sorted([id_a1, id_a2, id_b])
+    totals = rep["totals"]
+    assert totals["covered_s"] == 30.0
+    assert totals["overlap_s"] == 10.0
+    assert totals["gap_s"] == 10.0
+    assert totals["covered_s"] + totals["gap_s"] == totals["window_s"]
+
+
+def test_duplicate_abut_and_partial_overlap_union_is_fully_covered(client):
+    # README scenario over a 60 s window:
+    #   A: [0,20)          (batch 1)
+    #   B: [0,20) identical data -> duplicate of A (batch 2)
+    #   C: [20,40)         (batch 3)
+    #   D: [30,50), different data/hash (batch 4)
+    # Coverage union: [0,50) one segment (max depth 2); overlap [30,40);
+    # trailing gap [50,60).  covered_s + gap_s == window_s.
+    id_a = _ingest(client, BASE_DT, 20.0, "FF01")
+    id_b = _ingest(client, BASE_DT, 20.0, "FF02")
+    id_c = _ingest(client, BASE_DT + timedelta(seconds=20), 20.0, "FF03")
+    id_d = _ingest(client, BASE_DT + timedelta(seconds=30), 20.0, "FF04",
+                   target_arrivals=[(5.0, 4.0)], target_noise=0.09)
+    resp = _check(client)
+    rep = resp.json()
+
+    assert rep["ingested_waveform_count"] == 4
+    assert rep["unique_segment_count"] == 3
+    assert rep["duplicate_waveform_count"] == 1
+
+    assert len(rep["coverage"]) == 1
+    cov = rep["coverage"][0]
+    assert cov["start"] == _iso(BASE_DT)
+    assert cov["end"] == _iso(BASE_DT + timedelta(seconds=50))
+    assert cov["duration_s"] == 50.0
+    assert cov["coverage_count"] == 2
+    assert sorted(cov["ingestion_ids"]) == sorted([id_a, id_b, id_c, id_d])
+
+    assert len(rep["overlaps"]) == 1
+    ov = rep["overlaps"][0]
+    assert ov["start"] == _iso(BASE_DT + timedelta(seconds=30))
+    assert ov["end"] == _iso(BASE_DT + timedelta(seconds=40))
+    assert ov["duration_s"] == 10.0
+    assert ov["coverage_count"] == 2
+    assert sorted(ov["ingestion_ids"]) == sorted([id_c, id_d])
+
+    assert [g["gap_kind"] for g in rep["gaps"]] == ["trailing"]
+    totals = rep["totals"]
+    assert totals["covered_s"] == 50.0
+    assert totals["overlap_s"] == 10.0
+    assert totals["gap_s"] == 10.0
+    assert totals["window_s"] == 60.0
+    assert totals["covered_s"] + totals["gap_s"] == totals["window_s"]
+    assert totals["covered_segment_count"] == 1
+    assert totals["overlap_segment_count"] == 1
+    assert totals["gap_count"] == 1
+
+
+def test_overlap_at_window_edge_still_belongs_to_coverage(client):
+    # Two distinct segments overlapping right at the start of the window:
+    # depth 2 on [0,10), depth 1 on [10,30); the depth-2 prefix must not be
+    # dropped from coverage.
+    _ingest(client, BASE_DT, 30.0, "FF01")
+    _ingest(client, BASE_DT, 10.0, "FF02",
+            target_arrivals=[(3.0, 5.0)], target_noise=0.11)
+    resp = _check(client, end=BASE_DT + timedelta(seconds=30))
+    rep = resp.json()
+    assert len(rep["coverage"]) == 1
+    cov = rep["coverage"][0]
+    assert cov["start"] == _iso(BASE_DT)
+    assert cov["end"] == _iso(BASE_DT + timedelta(seconds=30))
+    assert cov["duration_s"] == 30.0
+    assert cov["coverage_count"] == 2
+    assert rep["overlaps"][0]["duration_s"] == 10.0
+    totals = rep["totals"]
+    assert totals["covered_s"] == 30.0
+    assert totals["overlap_s"] == 10.0
+    assert totals["gap_s"] == 0.0
+    assert totals["covered_s"] + totals["gap_s"] == totals["window_s"]
 
 
 # --------------------------------------------------------------------------- #

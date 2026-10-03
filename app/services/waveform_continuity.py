@@ -15,14 +15,25 @@ acquisition ranges overlap?":
   data hash are all identical are the same acquired segment and count once;
   every ingestion id carrying that segment is retained so re-ingestions stay
   auditable.
-* Endpoints are swept left to right: an interior point covered by ``>= 1``
-  unique segment is **covered**, by ``>= 2`` unique segments it is
-  **overlapping** (overlap means acquisition ranges coincide -- nothing is
-  inferred about sample-content conflicts).  Abutting intervals of the same
-  class are merged.
+* Endpoints are swept left to right and each open interior is classified by
+  the number of **unique** segments covering it: ``0`` deep means **gap**,
+  ``>= 1`` deep means **covered** (the coverage union), and the ``>= 2`` deep
+  subintervals are additionally listed as **overlaps** (overlap means
+  acquisition ranges coincide -- nothing is inferred about sample-content
+  conflicts).  Coverage segments are therefore the union of everything
+  acquired and *include* their overlap subintervals; the two lists overlap in
+  time but never double-count anything in ``totals``.
+* Consecutive covered cells are merged even when their depth changes across
+  the boundary (e.g. depth 2 abutting depth 1 stays one coverage segment), as
+  are consecutive overlap-only and gap cells.  Every ingestion id covering any
+  part of a merged segment is retained, and ``coverage_count`` is the highest
+  unique-segment depth reached inside the segment.
 * Gaps are the uncovered interior subintervals, classified as leading,
   trailing or internal; a window with no records for a known station yields a
   single whole-window gap.  A station that was never ingested returns 404.
+
+Invariant: ``covered_s + gap_s == window_s``; ``overlap_s`` is the portion of
+``covered_s`` whose depth is >= 2 (never an addend in the partition).
 
 The check is purely derived and never writes state, so its result is
 independent of run/directory state; ingestion and pick-gap reports are
@@ -37,9 +48,13 @@ from sqlalchemy.orm import Session
 from ..models import Waveform
 from .pipeline import ApiError, from_epoch, iso_z, to_epoch, to_naive_utc
 
-# Half-open interval classes.
+# Half-open interval classes.  A cell's class is the depth of unique-segment
+# coverage over its open interior; CLASS_COVERED means "in the coverage union"
+# (depth >= 1) and the depth>=2 cells of that union are mirrored into the
+# separate ``overlaps`` list.  CLASS_OVERLAP cells thus appear in *both* the
+# merged coverage segments and the merged overlap segments.
 CLASS_GAP = "gap"          # zero unique segments cover the interior
-CLASS_COVERED = "covered"  # exactly one unique segment covers the interior
+CLASS_COVERED = "covered"  # >= 1 unique segment covers the interior (union)
 CLASS_OVERLAP = "overlap"  # >= 2 unique segments cover the interior
 
 # Segment endpoints closer than this are the same sample instant computed two
@@ -116,11 +131,17 @@ def continuity_check(
     segments.sort(key=lambda s: (s["start"], s["end"], s["ingestion_ids"][0]))
 
     raw_intervals = _sweep(w0, w1, segments)
-    merged = _merge_abutting(raw_intervals)
-
-    covered = [iv for iv in merged if iv["kind"] == CLASS_COVERED]
-    overlaps = [iv for iv in merged if iv["kind"] == CLASS_OVERLAP]
-    gaps = [iv for iv in merged if iv["kind"] == CLASS_GAP]
+    # Coverage is the depth>=1 union: merge runs of consecutive non-gap cells
+    # (depth may rise above and fall back across abutments).  Overlaps are the
+    # depth>=2 subintervals of that same union, merged on their own, so the
+    # two lists overlap in time but totals never double-count their seconds.
+    covered = _merge_coverage(raw_intervals)
+    overlaps = _merge_abutting(
+        [iv for iv in raw_intervals if iv["kind"] == CLASS_OVERLAP]
+    )
+    gaps = _merge_abutting(
+        [iv for iv in raw_intervals if iv["kind"] == CLASS_GAP]
+    )
     _label_gaps(gaps, w0, w1)
 
     duplicates = sorted(
@@ -140,6 +161,8 @@ def continuity_check(
                        d["data_sha256"]),
     )
 
+    # Partition of the window: covered union + gaps == window_s.  overlap_s is
+    # the depth>=2 part already counted in covered_s, not a third addend.
     covered_s = sum(iv["end"] - iv["start"] for iv in covered)
     overlap_s = sum(iv["end"] - iv["start"] for iv in overlaps)
     gap_s = sum(iv["end"] - iv["start"] for iv in gaps)
@@ -198,7 +221,7 @@ def _parse_window_bound(value: str | None, field: str) -> datetime:
 # endpoint sweep over half-open intervals
 # --------------------------------------------------------------------------- #
 def _sweep(win_start: float, win_end: float, segments: list[dict]) -> list[dict]:
-    """Partition ``[win_start, win_end)`` into gap/covered/overlap intervals.
+    """Partition ``[win_start, win_end)`` into raw depth cells.
 
     All segment and window endpoints become partition coordinates; coincident
     coordinates (within :data:`EPS_S`, i.e. "same sample instant" computed two
@@ -206,8 +229,12 @@ def _sweep(win_start: float, win_end: float, segments: list[dict]) -> list[dict]
     Membership of each open interior is evaluated against every segment's
     half-open range: a segment counts when ``start <= left`` and
     ``right <= end``, which mirrors the sweep (at the left boundary the
-    segment's start already fired and its end has not).  Segment counts per
-    station window are small, so the direct predicate stays clear.
+    segment's start already fired and its end has not).  Depth ``0`` is a gap;
+    every depth ``>= 1`` cell is tagged covered (the union), and the depth
+    ``>= 2`` cells additionally carry the overlap tag so the caller can build
+    the coverage union and the overlap subintervals from the same cells.
+    Segment counts per station window are small, so the direct predicate
+    stays clear.
     """
     coords = sorted(
         {win_start, win_end}
@@ -253,6 +280,38 @@ def _union_ingestion_ids(segments: list[dict], active_ids: set[int]) -> list[str
     return sorted(ids)
 
 
+def _merge_coverage(intervals: list[dict]) -> list[dict]:
+    """Merge the depth>=1 cells into coverage-union segments.
+
+    Consecutive non-gap cells belong to one coverage segment even when their
+    depth changes across the abutment (depth 1 -> 2 -> 1 is one continuous
+    acquired range); only a gap cell breaks the run.  The merged segment keeps
+    *every* ingestion covering any part and reports the highest unique depth
+    reached inside it as ``coverage_count``.
+    """
+    merged: list[dict] = []
+    for iv in intervals:
+        if iv["kind"] == CLASS_GAP:
+            continue
+        if (
+            merged
+            and iv["start"] - merged[-1]["end"] <= EPS_S
+        ):
+            prev = merged[-1]
+            prev["end"] = iv["end"]
+            ids = set(prev["ingestion_ids"]) | set(iv["ingestion_ids"])
+            prev["ingestion_ids"] = sorted(ids)
+            prev["coverage_count"] = max(
+                prev["coverage_count"], iv["coverage_count"]
+            )
+        else:
+            merged.append(dict(iv))
+            # A coverage segment is the union; its tag stays "covered" even
+            # when its first cell is a depth>=2 overlap cell.
+            merged[-1]["kind"] = CLASS_COVERED
+    return merged
+
+
 def _merge_abutting(intervals: list[dict]) -> list[dict]:
     """Merge consecutive intervals of the same class (abutting ranges)."""
     merged: list[dict] = []
@@ -264,9 +323,8 @@ def _merge_abutting(intervals: list[dict]) -> list[dict]:
         ):
             prev = merged[-1]
             prev["end"] = iv["end"]
-            # Same coverage class => same coverage count; the union keeps every
-            # source ingestion that covers either side (relevant when two
-            # one-deep segments touch, which is one merged covered interval).
+            # Same coverage class => the union keeps every source ingestion
+            # that covers either side; coverage_count takes the deeper cell.
             ids = set(prev["ingestion_ids"]) | set(iv["ingestion_ids"])
             prev["ingestion_ids"] = sorted(ids)
             prev["coverage_count"] = max(prev["coverage_count"], iv["coverage_count"])
